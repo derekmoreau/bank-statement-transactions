@@ -2,10 +2,23 @@
 .DS_Store
 .ipynb_checkpoints/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.vscode/
+.idea/
+
+# Virtual envs & dotenv
+.venv/
+venv/
+env/
+.env
+.env.*
 
 # Local data & artifacts
 data/
+uploads/
+output/
+exports/
 *.pdf
 *.csv
 *.xlsx
@@ -15,4 +28,12 @@ logs/
 
 # Streamlit / app state
 .streamlit/secrets.toml
-.streamlit/*.yaml
+#! Uncomment next line if you want to *commit* your public config:
+# !.streamlit/config.toml
+
+# Optional: testing/typing/formatting caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
