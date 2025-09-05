@@ -151,11 +151,18 @@ def parse_summary_generic(full_text: str):
     def f2(x): return float(x.replace('$', '').replace(',', ''))
 
     # RBC chequing
-    m_dep = re.search(r'(?i)Total\s+deposits.*?([+\-]?\$?[\d,]+\.\d{2})', full_text)
-    m_wdr = re.search(r'(?i)Total\s+withdrawals.*?([+\-]?\$?[\d,]+\.\d{2})', full_text)
+    m_dep = re.search(r'(?i)Total\s+deposits\s+into\s+your\s+account.*?([+\-]?\$?[\d,]+\.\d{2})', full_text)
+    m_wdr = re.search(r'(?i)Total\s+withdrawals\s+from\s+your\s+account.*?([+\-]?\$?[\d,]+\.\d{2})', full_text)
     if m_dep and m_wdr:
         return {'pos_label': 'Total deposits', 'pos_value': +f2(m_dep.group(1)),
                 'neg_label': 'Total withdrawals', 'neg_value': -abs(f2(m_wdr.group(1)))}
+    
+    # RBC chequing (alternative format)
+    m_dep_alt = re.search(r'(?i)Total\s+deposits.*?([+\-]?\$?[\d,]+\.\d{2})', full_text)
+    m_wdr_alt = re.search(r'(?i)Total\s+withdrawals.*?([+\-]?\$?[\d,]+\.\d{2})', full_text)
+    if m_dep_alt and m_wdr_alt:
+        return {'pos_label': 'Total deposits', 'pos_value': +f2(m_dep_alt.group(1)),
+                'neg_label': 'Total withdrawals', 'neg_value': -abs(f2(m_wdr_alt.group(1)))}
 
     # RBC Mastercard
     m_pay = re.search(r'(?i)Payments\s*&\s*credits\s+(-?\$?[\d,]+\.\d{2}|\([\d,]+\.\d{2}\))', full_text)
@@ -245,8 +252,7 @@ def parse_bmo_from_text(full_text, start_dt, end_dt) -> pd.DataFrame:
         amt_str = am_match.group(1).strip()
         desc = body[:am_match.start()].strip()
         rows.append({
-            'Transaction Date': interpret_transaction_date(td_raw, start_dt, end_dt),
-            'Posting Date': interpret_transaction_date(pd_raw, start_dt, end_dt),
+            'Date': interpret_transaction_date(td_raw, start_dt, end_dt),
             'Description': desc,
             'Amount': parse_amount(amt_str)
         })
@@ -271,8 +277,7 @@ def parse_rbc_mc_from_text(full_text, start_dt, end_dt) -> pd.DataFrame:
         amt_str = am_match.group(1).strip()
         desc = body[:am_match.start()].strip()
         rows.append({
-            'Transaction Date': interpret_transaction_date(td_raw, start_dt, end_dt),
-            'Posting Date': interpret_transaction_date(pd_raw, start_dt, end_dt),
+            'Date': interpret_transaction_date(td_raw, start_dt, end_dt),
             'Description': desc,
             'Amount': parse_amount(amt_str)
         })
@@ -280,46 +285,132 @@ def parse_rbc_mc_from_text(full_text, start_dt, end_dt) -> pd.DataFrame:
 
 def parse_rbc_chequing_from_text(full_text, start_dt, end_dt) -> pd.DataFrame:
     """
-    RBC chequing: supports BOTH "21 Dec" and "Dec 21" anchors.
-    Each date block may contain multiple entries; we grab <desc> <amount> [balance].
+    RBC chequing: handles the table format with Date, Description, Withdrawals ($), Deposits ($), Balance ($)
+    Date format is "DD Mon" (e.g., "21 Jul", "29 Jul")
     """
-    # Find both "dd Mon" and "Mon dd"
-    date_anchor = re.compile(
-        r'((?:\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?))|'
-        r'(?:(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}))\b',
-        re.IGNORECASE
+    # The text is completely concatenated, so we need to be more aggressive with preprocessing
+    processed_text = full_text
+    
+    # Add spaces around amounts (more aggressive)
+    processed_text = re.sub(r'(\$?[\d,]+\.\d{2})', r' \1 ', processed_text)
+    
+    # Add spaces around dates (more aggressive)
+    processed_text = re.sub(r'(\d{1,2}(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)', r' \1 ', processed_text, flags=re.IGNORECASE)
+    
+    # Add spaces around common transaction keywords
+    transaction_keywords = [
+        'Contactless Interac purchase', 'Interac purchase', 'Payroll Deposit', 'e-Transfer sent',
+        'Online Transfer', 'Health/Dental Claim', 'Monthly fee', 'Opening Balance', 'Closing Balance'
+    ]
+    
+    for keyword in transaction_keywords:
+        processed_text = re.sub(r'(' + re.escape(keyword) + r')', r' \1 ', processed_text, flags=re.IGNORECASE)
+    
+    # Add spaces around common patterns
+    processed_text = re.sub(r'(Details of your account activity)', r' \1 ', processed_text, flags=re.IGNORECASE)
+    processed_text = re.sub(r'(Summary of your account for this period)', r' \1 ', processed_text, flags=re.IGNORECASE)
+    
+    # Normalize whitespace
+    processed_text = re.sub(r'\s+', ' ', processed_text)
+    
+    # Look for the transaction table section with more flexible patterns
+    table_start_patterns = [
+        r'Details of your account activity',
+        r'Details of your account activity - continued',
+        r'Account Activity',
+        r'Transaction Details',
+        r'Opening Balance',  # Sometimes transactions start after opening balance
+        r'Your opening balance'  # Alternative opening balance text
+    ]
+    
+    table_start = 0
+    for pattern in table_start_patterns:
+        match = re.search(pattern, processed_text, re.IGNORECASE)
+        if match:
+            table_start = match.end()
+            break
+    
+    # Extract the table content
+    table_text = processed_text[table_start:]
+    
+    # Remove the summary section at the end
+    summary_patterns = [
+        r'Summary of your account for this period',
+        r'Important information about your account',
+        r'Please check this Account Statement',
+        r'Monthly fee',
+        r'Closing Balance'
+    ]
+    
+    for pattern in summary_patterns:
+        match = re.search(pattern, table_text, re.IGNORECASE)
+        if match:
+            table_text = table_text[:match.start()]
+            break
+    
+    # If we still can't find the table section, try a different approach
+    # Look for patterns that indicate transactions directly in the concatenated text
+    if not table_text.strip():
+        # Try to find transaction patterns in the original text
+        # Look for date patterns followed by amounts
+        transaction_pattern = re.compile(
+            r'(\d{1,2}(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)'  # Date
+            r'([^$]*?)'  # Description (everything until we hit a dollar amount)
+            r'(\$?[\d,]+\.\d{2})'  # Amount
+            r'(?=\d{1,2}(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*|$)',  # Lookahead for next date or end
+            re.IGNORECASE | re.MULTILINE
+        )
+        table_text = full_text
+    
+    # Now look for transaction patterns in the processed text
+    # Pattern: Date (DD Mon) followed by description and amounts
+    transaction_pattern = re.compile(
+        r'(\d{1,2}(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)\s+'  # Date
+        r'([^$]+?)\s*'  # Description (everything until we hit a dollar amount)
+        r'(\$?[\d,]+\.\d{2})?\s*'  # Optional withdrawal amount
+        r'(\$?[\d,]+\.\d{2})?\s*'  # Optional deposit amount  
+        r'(\$?[\d,]+\.\d{2})?\s*'  # Optional balance amount
+        r'(?=\d{1,2}(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*|$)',  # Lookahead for next date or end
+        re.IGNORECASE | re.MULTILINE
     )
-    # In each block, capture: <desc> <amount> [balance]
-    amt_bal_re = re.compile(rf'(.*?){AMT}(?:\s+(\d{{1,3}}(?:,\d{{3}})*\.\d{{2}}))?(?:\s|$)')
-
-    matches = list(date_anchor.finditer(full_text))
+    
     rows = []
-    for i, m in enumerate(matches):
-        start = m.start()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(full_text)
-        block = full_text[start:end].strip()
-        head = m.group(1)  # e.g., "21 Dec" OR "Dec 21"
-        rest = block[len(head):].strip()
-
-        for mm in amt_bal_re.finditer(rest):
-            desc = (mm.group(1) or "").strip()
-            if not desc:
+    
+    for match in transaction_pattern.finditer(table_text):
+        date_str = match.group(1).strip()
+        description = match.group(2).strip()
+        withdrawal_str = match.group(3)
+        deposit_str = match.group(4)
+        balance_str = match.group(5)
+        
+        # Skip empty or invalid rows
+        if not description or description.lower().strip() in ['', 'opening balance', 'closing balance']:
+            continue
+            
+        # Determine amount and sign
+        amount = 0.0
+        if withdrawal_str and withdrawal_str.strip():
+            amount = -parse_amount(withdrawal_str)
+        elif deposit_str and deposit_str.strip():
+            amount = parse_amount(deposit_str)
+        else:
+            # Try to determine from description
+            desc_lower = description.lower()
+            if any(k in desc_lower for k in ['deposit', 'payroll', 'refund', 'credit', 'received']):
+                # This should be a deposit, but we don't have the amount
                 continue
-            amount = parse_amount(mm.group(2))
-            dl = desc.lower()
-            # EN + FR sign heuristics
-            if any(k in dl for k in ['deposit', 'received', 'payroll', 'refund', 'credit', 'dépôt', 'remboursement']):
-                sign_amt = +amount
-            elif any(k in dl for k in ['fee', 'purchase', 'withdrawal', 'sent', 'interac', 'payment', 'transfer', 'retrait', 'paiement', 'frais']):
-                sign_amt = -amount
+            elif any(k in desc_lower for k in ['withdrawal', 'purchase', 'sent', 'interac', 'payment', 'transfer', 'fee']):
+                # This should be a withdrawal, but we don't have the amount
+                continue
             else:
-                sign_amt = -amount  # default
-            rows.append({
-                'Transaction Date': interpret_transaction_date(head, start_dt, end_dt),
-                'Posting Date': None,
-                'Description': desc,
-                'Amount': sign_amt
-            })
+                continue  # Skip if we can't determine amount
+        
+        rows.append({
+            'Date': interpret_transaction_date(date_str, start_dt, end_dt),
+            'Description': description,
+            'Amount': amount
+        })
+    
     return pd.DataFrame(rows)
 
 def parse_scotia_chequing_from_text(full_text, start_dt, end_dt) -> pd.DataFrame:
@@ -344,8 +435,7 @@ def parse_scotia_chequing_from_text(full_text, start_dt, end_dt) -> pd.DataFrame
         else:
             signed = +amt if ('deposit' in dl or 'dépôt' in dl) else -amt
         rows.append({
-            'Transaction Date': interpret_transaction_date(f"{mon} {day}", start_dt, end_dt),
-            'Posting Date': None,
+            'Date': interpret_transaction_date(f"{mon} {day}", start_dt, end_dt),
             'Description': desc.strip(),
             'Amount': signed
         })
@@ -454,5 +544,85 @@ def main():
             mime="text/csv"
         )
 
+def cli_main():
+    """Command line interface for the bank statement parser."""
+    import argparse
+    import os
+    import sys
+    
+    parser = argparse.ArgumentParser(description="Parse bank statement PDFs and export to CSV")
+    parser.add_argument("pdf_files", nargs="+", help="Path(s) to PDF statement file(s)")
+    parser.add_argument("-o", "--output", default="bank_statements.csv", help="Output CSV file name")
+    parser.add_argument("--force-ocr", action="store_true", help="Force OCR for all pages")
+    parser.add_argument("--debug", action="store_true", help="Show debug information")
+    
+    args = parser.parse_args()
+    
+    # Check if files exist
+    for pdf_file in args.pdf_files:
+        if not os.path.exists(pdf_file):
+            print(f"Error: File '{pdf_file}' not found")
+            sys.exit(1)
+    
+    combined = pd.DataFrame()
+    
+    for pdf_file in args.pdf_files:
+        print(f"Processing: {pdf_file}")
+        
+        try:
+            with open(pdf_file, 'rb') as f:
+                data = f.read()
+            
+            if args.force_ocr:
+                # OCR every page unconditionally
+                images = convert_from_bytes(data, dpi=300)
+                pages_text = [pytesseract.image_to_string(img, lang="eng") for img in images]
+                full_text = re.sub(r'\s+', ' ', " ".join(pages_text)).strip()
+            else:
+                pages_text, full_text = extract_pages_text_with_ocr_fallback(data)
+            
+            if args.debug:
+                print(f"Debug - First 200 chars: {full_text[:200]}...")
+            
+            first_page_text = pages_text[0] if pages_text else ""
+            df, summary = parse_any_statement_from_text(first_page_text, full_text)
+            
+            if df.empty:
+                print(f"  ⚠️  No transactions found in {pdf_file}")
+                continue
+            
+            print(f"  ✅ Found {len(df)} transactions")
+            
+            if summary:
+                pos_sum = round(df.loc[df['Amount'] > 0, 'Amount'].sum(), 2)
+                neg_sum = round(df.loc[df['Amount'] < 0, 'Amount'].sum(), 2)
+                pos_ok = abs(pos_sum - round(summary['pos_value'], 2)) < 0.01
+                neg_ok = abs(neg_sum - round(summary['neg_value'], 2)) < 0.01
+                
+                print(f"  📊 {summary['pos_label']}: {pos_sum:.2f} (expected: {summary['pos_value']:.2f}) {'✅' if pos_ok else '❌'}")
+                print(f"  📊 {summary['neg_label']}: {neg_sum:.2f} (expected: {summary['neg_value']:.2f}) {'✅' if neg_ok else '❌'}")
+            
+            df['Source File'] = os.path.basename(pdf_file)
+            combined = pd.concat([combined, df], ignore_index=True)
+            
+        except Exception as e:
+            print(f"  ❌ Error processing {pdf_file}: {str(e)}")
+            continue
+    
+    if not combined.empty:
+        combined.to_csv(args.output, index=False)
+        print(f"\n🎉 Success! Exported {len(combined)} transactions to '{args.output}'")
+        print(f"📁 Files processed: {len(args.pdf_files)}")
+    else:
+        print("\n❌ No transactions found in any of the provided files")
+        sys.exit(1)
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--cli":
+        cli_main()
+    elif len(sys.argv) > 1:
+        cli_main()
+    else:
+        # Default to Streamlit web interface when clicking "Run" in Cursor
+        main()
