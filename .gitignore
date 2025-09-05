@@ -31,7 +31,7 @@ logs/
 #! Uncomment next line if you want to *commit* your public config:
 # !.streamlit/config.toml
 
-# Optional: testing/typing/formatting caches
+# Testing/typing/formatting caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
