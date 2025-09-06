@@ -76,7 +76,23 @@ def main():
     
     for i, f in enumerate(files):
         status_text.text(f"Processing {i+1}/{len(files)}: {f.name}")
-        progress_bar.progress((i + 1) / len(files))
+        progress_bar.progress((i * 4 + 1) / (len(files) * 4))  # 25% for start
+        
+        # Step 1: File reading
+        status_text.text(f"Reading file {i+1}/{len(files)}: {f.name}")
+        progress_bar.progress((i * 4 + 1) / (len(files) * 4))
+        
+        # Step 2: Text extraction/OCR
+        status_text.text(f"Extracting text {i+1}/{len(files)}: {f.name}")
+        progress_bar.progress((i * 4 + 2) / (len(files) * 4))
+        
+        # Step 3: Parsing transactions
+        status_text.text(f"Parsing transactions {i+1}/{len(files)}: {f.name}")
+        progress_bar.progress((i * 4 + 3) / (len(files) * 4))
+        
+        # Step 4: Processing complete
+        status_text.text(f"Processing complete {i+1}/{len(files)}: {f.name}")
+        progress_bar.progress((i * 4 + 4) / (len(files) * 4))
         
         with st.expander(f"📄 {f.name}", expanded=True):
             try:
@@ -134,11 +150,8 @@ Statement type detected: {detect_statement_type(first_page_text)}
 
 Full text length: {len(full_text)} characters
 
-First 500 characters:
-{full_text[:500]}
-
-Processed text (first 500 chars):
-{processed_text[:500] if 'processed_text' in locals() else 'Not processed yet'}
+Processed text (full text):
+{processed_text if 'processed_text' in locals() else 'Not processed yet'}
 
 Table section detection:
 """
@@ -174,8 +187,6 @@ Table section detection:
                     # Display debug info
                     st.write(f"**Statement type detected:** {detect_statement_type(first_page_text)}")
                     st.write(f"**Full text length:** {len(full_text)} characters")
-                    st.write(f"**First 500 characters:**")
-                    st.code(full_text[:500])
                     
                     # Show processed text
                     processed_text = full_text
@@ -183,11 +194,11 @@ Table section detection:
                     processed_text = re.sub(r'(\d{1,2}(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)', r' \1 ', processed_text, flags=re.IGNORECASE)
                     processed_text = re.sub(r'\s+', ' ', processed_text)
                     
-                    st.write(f"**Processed text (first 500 chars):**")
-                    st.code(processed_text[:500])
+                    st.write(f"**Processed text (full text):**")
+                    st.code(processed_text)
                     
                     # Update debug output with processed text
-                    debug_output = debug_output.replace("Not processed yet", processed_text[:500])
+                    debug_output = debug_output.replace("Not processed yet", processed_text)
                     
                     # Display the debug info
                     st.write("**Table section detection:**")
@@ -211,12 +222,30 @@ Table section detection:
                     else:
                         st.warning("❌ No amount patterns found")
                     
+                    
                     # Copy button for full debug output
                     if st.button("📋 Copy Full Debug Output", key="copy_debug_output"):
                         st.text_area("Debug Output (copy this):", debug_output, height=300)
                         st.write("Debug output displayed above - copy the text from the text area!")
 
-                df, summary = parse_any_statement_from_text(first_page_text, full_text)
+                df, summary = parse_any_statement_from_text(first_page_text, full_text, data, getattr(f, 'name', None))
+                
+                # Add transactions info to debug output for RBC statements
+                if 'rbc' in first_page_text.lower() or 'royal bank' in first_page_text.lower():
+                    if not df.empty:
+                        debug_output += f"\n✅ Found {len(df)} transactions:\n"
+                        for idx, row in df.iterrows():
+                            debug_output += f"  {idx+1}. {row['Date']} - {row['Description']} - ${row['Amount']:.2f}\n"
+                        
+                        # Display transactions in the debug section
+                        st.write("**Transactions found:**")
+                        st.success(f"✅ Found {len(df)} transactions:")
+                        for idx, row in df.iterrows():
+                            st.write(f"  {idx+1}. {row['Date']} - {row['Description']} - ${row['Amount']:.2f}")
+                    else:
+                        debug_output += f"\n❌ No transactions found\n"
+                        st.write("**Transactions found:**")
+                        st.warning("❌ No transactions found")
                 
                 if df.empty:
                     st.warning("⚠️ No transactions found — PDF may be low-quality scan or needs pattern tweaks")
