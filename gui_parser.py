@@ -150,7 +150,7 @@ class BankStatementParserGUI:
                     self.results_text.insert(tk.END, f"Debug - First 200 chars: {full_text[:200]}...\n")
                 
                 first_page_text = pages_text[0] if pages_text else ""
-                df, summary = parse_any_statement_from_text(first_page_text, full_text)
+                df, summary = parse_any_statement_from_text(first_page_text, full_text, data, os.path.basename(pdf_file))
                 
                 if df.empty:
                     self.results_text.insert(tk.END, f"  ⚠️  No transactions found\n")
