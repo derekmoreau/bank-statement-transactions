@@ -581,6 +581,110 @@ def parse_scotia_chequing_from_text(full_text, start_dt, end_dt) -> pd.DataFrame
     return pd.DataFrame(rows)
 
 # =========================
+# Scotiabank balance-delta extractor (coordinate aware)
+# =========================
+
+def _scotia_plumber_text_lines_from_bytes(data_bytes: bytes) -> list:
+    lines = []
+    with pdfplumber.open(io.BytesIO(data_bytes)) as pdf:
+        for p in pdf.pages:
+            txt = p.extract_text(x_tolerance=2, y_tolerance=2) or ""
+            for ln in txt.splitlines():
+                ln = (ln or "").strip()
+                if ln:
+                    lines.append(ln)
+    return lines
+
+def _scotia_parse_year_from_bytes(data_bytes: bytes, fallback_name: str = "") -> int:
+    lines = _scotia_plumber_text_lines_from_bytes(data_bytes)
+    for ln in lines:
+        m = re.search(r"(?:Opening|Closing)\s+Balance\s+on\s+[A-Za-z]+\s+\d{1,2},\s*(\d{4})", ln)
+        if m:
+            try:
+                return int(m.group(1))
+            except Exception:
+                pass
+    m = re.search(r"(20\d{2})", fallback_name or "")
+    return int(m.group(1)) if m else datetime.now().year
+
+def parse_scotia_from_pdf_balance_delta(data_bytes: bytes, source_name: str = "") -> pd.DataFrame:
+    """
+    Reconstruct Scotiabank rows using pdfplumber words and compute signed Amount from balance deltas only.
+    Output columns: Date (DD/MM/YYYY), Description, Amount
+    """
+    MONTHS = {
+        "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+        "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12
+    }
+    MONTHS_ORDER = list(MONTHS.keys())
+    MD_GLUED_RE = re.compile(r"^\d{4}(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)(\d{1,2})$")
+    MONEY_PAT = r"\d{1,3}(?:,\d{3})*\.\d{2}"
+
+    year = _scotia_parse_year_from_bytes(data_bytes, source_name)
+
+    rows = []
+    with pdfplumber.open(io.BytesIO(data_bytes)) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=2, y_tolerance=2) or []
+            if not words:
+                continue
+            words.sort(key=lambda w: (round(w.get("top", 0.0), 1), w.get("x0", 0.0)))
+            seq = [(w.get("text", ""), float(w.get("x0", 0.0)), float(w.get("top", 0.0))) for w in words]
+
+            starts = []
+            for idx in range(len(seq)):
+                t0 = seq[idx][0]
+                t1 = seq[idx+1][0] if idx+1 < len(seq) else ""
+                if t0 in MONTHS_ORDER and re.fullmatch(r"\d{1,2}", t1 or ""):
+                    starts.append((idx, t0, t1))
+                else:
+                    g = MD_GLUED_RE.match(t0 or "")
+                    if g:
+                        mon, day = g.group(1), g.group(2)
+                        starts.append((idx, mon, day))
+
+            indices = [i for (i, _, _) in starts]
+            for si, (idx, mon, day) in enumerate(starts):
+                end = indices[si+1] if si+1 < len(indices) else len(seq)
+                chunk = seq[idx:end]
+                tokens = [t for (t, _x, _y) in chunk[2:]]  # after date tokens
+
+                money_pos = [i for i, t in enumerate(tokens) if re.fullmatch(MONEY_PAT, t or "")]
+                balance_after = float(tokens[money_pos[-1]].replace(",", "")) if money_pos else None
+                # Updated description logic: include all non-money tokens across the chunk
+                desc_tokens = [tok for tok in tokens if (tok is not None) and (not re.fullmatch(MONEY_PAT, tok)) and tok not in {"-", "I", "R", "H", "|", "$"}]
+                desc = " ".join(desc_tokens).strip()
+
+                date_iso = f"{year:04d}-{MONTHS.get(mon, 1):02d}-{int(day):02d}"
+                rows.append({"Date": date_iso, "Description": desc, "BalanceAfter": balance_after})
+
+    out = []
+    prev_bal = None
+    for r in rows:
+        desc = r.get("Description") or ""
+        bal = r.get("BalanceAfter")
+        if ("Opening Balance" in desc) and bal is not None and prev_bal is None:
+            prev_bal = bal
+            continue
+        if "Closing Balance" in desc:
+            prev_bal = bal
+            continue
+        if prev_bal is None or bal is None:
+            continue
+        delta = round(bal - prev_bal, 2)
+        d = r["Date"]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+            d = f"{d[8:10]}/{d[5:7]}/{d[:4]}"
+        out.append({
+            'Date': d,
+            'Description': desc,
+            'Amount': float(delta),
+        })
+        prev_bal = bal
+
+    return pd.DataFrame(out)
+
+# =========================
 # Master dispatcher
 # =========================
 
@@ -665,7 +769,14 @@ def parse_any_statement_from_text(first_page_text: str, full_text: str, data_byt
             # Last resort: old text heuristics
             df = parse_rbc_chequing_from_text(full_text, start_dt, end_dt)
     elif stype == 'SCOTIA_CHEQUING':
-        df = parse_scotia_chequing_from_text(full_text, start_dt, end_dt)
+        # Prefer balance-delta coordinate parser when bytes are available
+        if data_bytes is not None:
+            try:
+                df = parse_scotia_from_pdf_balance_delta(data_bytes, source_name or "")
+            except Exception:
+                df = parse_scotia_chequing_from_text(full_text, start_dt, end_dt)
+        else:
+            df = parse_scotia_chequing_from_text(full_text, start_dt, end_dt)
     else:
         # Try all if we couldn't detect type
         for fn in (parse_bmo_from_text, parse_rbc_mc_from_text, parse_rbc_chequing_from_text, parse_scotia_chequing_from_text):
