@@ -271,6 +271,9 @@ def parse_summary_generic(full_text: str):
 
 def detect_statement_type(first_page_text: str):
     t = (first_page_text or "").lower()
+    # Savings must be detected before generic RBC chequing
+    if ('savings account statement' in t) or ('high interest esavings' in t) or ('esavings' in t):
+        return 'RBC_SAVINGS'
     if 'rbc' in t or 'royal bank of canada' in t:
         if 'mastercard' in t or 'credit card payment' in t:
             return 'RBC_MC'
@@ -594,7 +597,46 @@ def parse_any_statement_from_text(first_page_text: str, full_text: str, data_byt
     if stype == 'BMO':
         df = parse_bmo_from_text(full_text, start_dt, end_dt)
     elif stype == 'RBC_MC':
-        df = parse_rbc_mc_from_text(full_text, start_dt, end_dt)
+        # Prefer char-based extractor
+        df = pd.DataFrame()
+        if data_bytes is not None:
+            closing_year = None
+            closing_month = None
+            if source_name:
+                m = re.search(r"(\d{4})-(\d{2})-(\d{2})\.pdf$", source_name, re.IGNORECASE)
+                if m:
+                    closing_year, closing_month = int(m.group(1)), int(m.group(2))
+            if (closing_year is None or closing_month is None) and end_dt:
+                closing_year, closing_month = end_dt.year, end_dt.month
+            try:
+                if closing_year is not None and closing_month is not None:
+                    df = parse_rbc_mastercard_from_pdf_chars(data_bytes, closing_year, closing_month)
+            except Exception:
+                df = pd.DataFrame()
+        if df.empty:
+            df = parse_rbc_mc_from_text(full_text, start_dt, end_dt)
+    elif stype == 'RBC_SAVINGS':
+        df = pd.DataFrame()
+        if data_bytes is not None:
+            closing_year = None
+            closing_month = None
+            if source_name:
+                m = re.search(r"(\d{4})-(\d{2})-(\d{2})\.pdf$", source_name, re.IGNORECASE)
+                if m:
+                    closing_year, closing_month = int(m.group(1)), int(m.group(2))
+            if (closing_year is None or closing_month is None) and end_dt:
+                closing_year, closing_month = end_dt.year, end_dt.month
+            try:
+                if closing_year is not None and closing_month is not None:
+                    df = parse_rbc_savings_from_pdf_chars(data_bytes, closing_year, closing_month)
+            except Exception:
+                df = pd.DataFrame()
+        if df.empty:
+            # Fallback: try text blocks pipeline
+            try:
+                df = parse_rbc_chequing_pdfium_pipeline(data_bytes, start_dt, end_dt) if data_bytes is not None else pd.DataFrame()
+            except Exception:
+                df = pd.DataFrame()
     elif stype == 'RBC_CHEQUING':
         # Prefer the new char-based pdfplumber logic using strict column ranges and date carry-forward
         df = pd.DataFrame()
@@ -1020,6 +1062,278 @@ def parse_rbc_chequing_from_pdf_chars(data_bytes: bytes, closing_year: int, clos
                         'Amount': round(amount, 2),
                     })
                     desc_buffer = ""
+
+    return pd.DataFrame(rows)
+
+def parse_rbc_savings_from_pdf_chars(data_bytes: bytes, closing_year: int, closing_month: int) -> pd.DataFrame:
+    """
+    RBC Savings extractor using the same description reconstruction as chequing.
+    - Column bands computed from header midpoints to classify numbers
+    - Description is rebuilt from per-line chars between Description and Withdrawals
+    - Date carry-forward; signs from column position (deposit positive, withdrawal negative)
+    """
+    import pdfplumber  # rely on existing dep
+
+    def find_headers(words):
+        variants = {
+            "Date": ["Date"],
+            "Description": ["Description"],
+            "Withdrawals": ["Withdrawals($)", "Withdrawals"],
+            "Deposits": ["Deposits($)", "Deposits"],
+            "Balance": ["Balance($)", "Balance"],
+        }
+        got = {}
+        for canonical, opts in variants.items():
+            hit = next((w for w in words if w.get("text") in opts), None)
+            if not hit:
+                return None
+            if canonical in ("Withdrawals", "Deposits", "Balance"):
+                got[canonical] = (float(hit["x0"]) + float(hit["x1"])) / 2.0
+            else:
+                got[canonical] = float(hit["x0"])
+        return got
+
+    def column_bands_from_headers(h):
+        xW, xD, xB = h["Withdrawals"], h["Deposits"], h["Balance"]
+        mWD = (xW + xD) / 2.0
+        mDB = (xD + xB) / 2.0
+        return {
+            "withdrawals": (xW - (mWD - xW), mWD),
+            "deposits": (mWD, mDB),
+            "balance": (mDB, mDB + (xB - xD)),
+        }
+
+    def assemble_line_text_from_chars(line_chars, gap_ratio: float = 0.33, min_abs_gap: float = 1.2) -> str:
+        if not line_chars: return ""
+        xs = [float(c["x0"]) for c in line_chars]
+        x1s = [float(c["x1"]) for c in line_chars]
+        widths = [x1s[i]-xs[i] for i in range(len(xs))]
+        widths_sorted = sorted(widths)
+        med_w = widths_sorted[len(widths_sorted)//2] if widths_sorted else 4.0
+        pieces = [line_chars[0]["text"]]
+        for i in range(len(line_chars)-1):
+            gap = xs[i+1]-x1s[i]
+            if gap > max(gap_ratio*med_w, min_abs_gap):
+                pieces.append(" ")
+            pieces.append(line_chars[i+1]["text"])
+        return "".join(pieces)
+
+    num_re = re.compile(r"^\$?\d{1,3}(?:,\d{3})*(?:\.\d{2})$|^\$?\d+\.\d{2}$")
+
+    rows = []
+    with pdfplumber.open(io.BytesIO(data_bytes)) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=2, y_tolerance=3, keep_blank_chars=False, use_text_flow=True)
+            if not words:
+                continue
+            headers = find_headers(words)
+            if not headers:
+                continue
+            bands = column_bands_from_headers(headers)
+
+            # Build lines and char-lines
+            lines = {}
+            for w in words:
+                y = round(float(w["top"]), 1)
+                lines.setdefault(y, []).append(w)
+            char_lines = {}
+            for c in page.chars:
+                y = round(float(c["top"]), 1)
+                char_lines.setdefault(y, []).append(c)
+            for y in char_lines:
+                char_lines[y] = sorted(char_lines[y], key=lambda c: float(c["x0"]))
+
+            seen_header = False
+            current_date = None
+            desc_buf = ""
+
+            for y in sorted(lines.keys()):
+                line_words = sorted(lines[y], key=lambda w: w["x0"])
+                joined = "".join(w["text"] for w in line_words)
+
+                if not seen_header and ("Date" in joined and "Description" in joined and "Withdrawals" in joined):
+                    seen_header = True
+                    continue
+                if not seen_header:
+                    continue
+                if "Detailsofyouraccountactivity" in joined or "Detailsofyouraccountactivity-continued" in joined:
+                    continue
+                if "PleasecheckthisAccountStatement" in joined:
+                    continue
+                if "RoyalBankofCanadaGSTRegistrationNumber" in joined:
+                    continue
+                if "ClosingBalance" in joined:
+                    continue
+
+                # date to left of Description
+                date_tokens = [w for w in line_words if float(w["x0"]) < headers["Description"] - 1]
+                if date_tokens:
+                    dtxt = "".join(w["text"] for w in date_tokens)
+                    if "OpeningBalance" in dtxt:
+                        desc_buf = ""
+                        continue
+                    m = re.match(r"^(\d{1,2})([A-Za-z]{3})$", dtxt.replace(" ", ""))
+                    if m:
+                        day = int(m.group(1))
+                        mon = m.group(2)
+                        # infer year
+                        mon_num = {
+                            "Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,
+                            "Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12
+                        }.get(mon, None)
+                        if mon_num:
+                            year = closing_year - 1 if mon_num > closing_month else closing_year
+                            current_date = f"{year:04d}-{mon_num:02d}-{day:02d}"
+                            desc_buf = ""
+
+                # description via chars between Description and withdrawals band
+                cline = char_lines.get(y, [])
+                if cline:
+                    desc_chars = [c for c in cline if headers["Description"]-1 <= float(c["x0"]) < bands["withdrawals"][0]-0.5]
+                    desc_text = assemble_line_text_from_chars(desc_chars).strip()
+                else:
+                    desc_tokens = [w for w in line_words if headers["Description"]-1 <= float(w["x0"]) < bands["withdrawals"][0]-0.5]
+                    desc_text = " ".join(w["text"] for w in desc_tokens).strip()
+
+                if desc_text:
+                    desc_buf = (f"{desc_buf} {desc_text}".strip() if desc_buf else desc_text)
+
+                def nums_in_band(left: float, right: float):
+                    out = []
+                    for w in line_words:
+                        x0, x1 = float(w["x0"]), float(w["x1"])
+                        xc = (x0 + x1) / 2.0
+                        if left <= xc < right:
+                            txt = w["text"].replace(",", "").replace("$", "")
+                            if num_re.match(txt):
+                                out.append((float(txt), w))
+                    out.sort(key=lambda t: t[1]["x0"])  # rightmost wins
+                    return out
+
+                wdrs = nums_in_band(*bands["withdrawals"])
+                deps = nums_in_band(*bands["deposits"])
+                bals = nums_in_band(*bands["balance"])
+
+                if (wdrs or deps) and current_date:
+                    amount = (deps[-1][0] if deps else 0.0) - (wdrs[-1][0] if wdrs else 0.0)
+                    rows.append({
+                        'Date': f"{current_date[8:10]}/{current_date[5:7]}/{current_date[:4]}",
+                        'Description': (desc_buf or '').strip(),
+                        'Amount': round(amount, 2),
+                    })
+                    desc_buf = ""
+
+    return pd.DataFrame(rows)
+
+def parse_rbc_mastercard_from_pdf_chars(data_bytes: bytes, closing_year: int, closing_month: int) -> pd.DataFrame:
+    """
+    Character-aware RBC Mastercard extractor.
+    - Finds Description and Amount columns
+    - Rebuilds description from chars with spillover handling
+    - Uses two dates on the left (transaction & posting); outputs posting date
+    - Amount sign comes from the text (negative for payments/credits)
+    Returns DataFrame with columns: Date (DD/MM/YYYY), Description, Amount
+    """
+    import pdfplumber
+
+    AMOUNT_RE = re.compile(r"-?\$?\d[\d,]*\.\d{2}")
+
+    def to_iso_from_mon_day(mon_str: str, day_str: str) -> str:
+        mon_map = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,"Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
+        mon = mon_map.get(mon_str[:3].title())
+        if mon is None:
+            return f"{mon_str} {day_str}"
+        year = closing_year - 1 if mon > closing_month else closing_year
+        return f"{year:04d}-{mon:02d}-{int(day_str):02d}"
+
+    def find_header_x_positions(words):
+        x_desc = None
+        x_amt = None
+        for w in words:
+            t = w.get("text", "").strip().upper().replace(" ", "")
+            if t in ("ACTIVITY","ACTIVITYDESCRIPTION","DESCRIPTION") and x_desc is None:
+                x_desc = float(w["x0"])
+            if t in ("AMOUNT($)","AMOUNT","AMOUNT($)DATE","AMOUNT($)POSTING") and x_amt is None:
+                x_amt = float(w["x0"])
+        if x_desc is None or x_amt is None:
+            xs = sorted(float(w.get("x0", 0.0)) for w in words)
+            if x_desc is None and xs:
+                x_desc = xs[len(xs)//3]
+            if x_amt is None and xs:
+                x_amt = xs[-1] - 100
+        return x_desc or 200.0, x_amt or 500.0
+
+    def group_chars_by_y(chars):
+        lines = {}
+        for c in chars:
+            y = round(float(c.get("top", 0.0)), 1)
+            lines.setdefault(y, []).append(c)
+        for y in list(lines.keys()):
+            lines[y] = sorted(lines[y], key=lambda cc: float(cc.get("x0", 0.0)))
+        return dict(sorted(lines.items()))
+
+    def assemble_from_chars(line_chars, gap_ratio: float = 0.33, min_abs_gap: float = 1.2) -> str:
+        if not line_chars: return ""
+        xs  = [float(c["x0"]) for c in line_chars]
+        x1s = [float(c["x1"]) for c in line_chars]
+        widths = [x1s[i]-xs[i] for i in range(len(xs))]
+        med_w = sorted(widths)[len(widths)//2] if widths else 4.0
+        out = [line_chars[0]["text"]]
+        for i in range(len(line_chars)-1):
+            gap = xs[i+1] - x1s[i]
+            if gap > max(gap_ratio*med_w, min_abs_gap):
+                out.append(" ")
+            out.append(line_chars[i+1]["text"])
+        return "".join(out)
+
+    rows = []
+    with pdfplumber.open(io.BytesIO(data_bytes)) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=2, y_tolerance=3, keep_blank_chars=False, use_text_flow=True)
+            if not words:
+                continue
+            x_desc, x_amt = find_header_x_positions(words)
+            char_lines = group_chars_by_y(page.chars)
+
+            for _y, cline in char_lines.items():
+                left_text_narrow = assemble_from_chars([c for c in cline if float(c["x0"]) < (x_desc - 2)]).strip()
+                left_text_wide   = assemble_from_chars([c for c in cline if float(c["x0"]) < (x_desc + 40)])
+                mid_text         = assemble_from_chars([c for c in cline if x_desc - 1 <= float(c["x0"]) < x_amt - 1]).strip()
+                right_text       = assemble_from_chars([c for c in cline if float(c["x0"]) >= x_amt - 12]).strip()
+
+                mdate = re.search(r"([A-Za-z]{3})\s*([0-9]{1,2})\s+([A-Za-z]{3})\s*([0-9]{1,2})", left_text_narrow)
+                if not mdate:
+                    continue
+
+                m_amt = list(AMOUNT_RE.finditer(right_text))
+                if not m_amt:
+                    continue
+
+                m_spill = re.match(r"^\s*[A-Za-z]{3}\s*\d{1,2}\s+[A-Za-z]{3}\s*\d{1,2}\s*(.*)$", left_text_wide)
+                spill = (m_spill.group(1) if m_spill else "").strip()
+                desc_parts = [p for p in (spill, mid_text) if p]
+                desc_text = re.sub(r"\s+", " ", " ".join(desc_parts)).strip()
+                if not desc_text:
+                    continue
+
+                tx_mon, tx_day, post_mon, post_day = mdate.groups()
+                post_iso = to_iso_from_mon_day(post_mon.title(), post_day)
+
+                val = float(m_amt[-1].group(0).replace(",", "").replace("$", ""))
+
+                if re.search(r"(TOTAL ACCOUNT BALANCE|NEW BALANCE|PREVIOUS ACCOUNT BALANCE|CASH BACK SUMMARY|INTEREST RATE)", desc_text, re.I):
+                    continue
+
+                # Output posting date as Date in DD/MM/YYYY
+                date_out = post_iso
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", date_out):
+                    date_out = f"{date_out[8:10]}/{date_out[5:7]}/{date_out[:4]}"
+
+                rows.append({
+                    'Date': date_out,
+                    'Description': desc_text,
+                    'Amount': round(val, 2),
+                })
 
     return pd.DataFrame(rows)
 

@@ -94,7 +94,7 @@ def main():
         status_text.text(f"Processing complete {i+1}/{len(files)}: {f.name}")
         progress_bar.progress((i * 4 + 4) / (len(files) * 4))
         
-        with st.expander(f"📄 {f.name}", expanded=True):
+        with st.expander(f"📄 {f.name}", expanded=False):
             try:
                 data = f.getvalue() if hasattr(f, "getvalue") else f.read()
                 
@@ -224,7 +224,7 @@ Table section detection:
                     
                     
                     # Copy button for full debug output
-                    if st.button("📋 Copy Full Debug Output", key="copy_debug_output"):
+                    if st.button("📋 Copy Full Debug Output", key=f"copy_debug_output_{i}"):
                         st.text_area("Debug Output (copy this):", debug_output, height=300)
                         st.write("Debug output displayed above - copy the text from the text area!")
 
