@@ -36,9 +36,9 @@ def main():
     # Sidebar for options
     with st.sidebar:
         st.header("⚙️ Options")
-        force_ocr = st.checkbox("Force OCR for all pages", value=True, 
+        force_ocr = st.checkbox("Force OCR for all pages", value=False, 
                                help="Slower but more robust for scanned PDFs")
-        show_debug = st.checkbox("Show debug information", value=True,
+        show_debug = st.checkbox("Show debug information", value=False,
                                 help="Display extracted text for troubleshooting")
         auto_download = st.checkbox("Auto-download CSV", value=True,
                                    help="Automatically download CSV when processing is complete")
