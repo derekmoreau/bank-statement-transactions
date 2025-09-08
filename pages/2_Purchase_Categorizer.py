@@ -27,10 +27,29 @@ except Exception:
 import pickle
 
 
+def _ensure_sklearn():
+    """Ensure scikit-learn is importable; try to install if missing."""
+    try:
+        import sklearn  # noqa: F401
+        return True
+    except Exception:
+        st.warning("Installing 'scikit-learn' to enable categorization…")
+        try:
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "scikit-learn", "joblib", "threadpoolctl"])  # noqa: S603,S607
+            import importlib
+            importlib.invalidate_caches()
+            import sklearn  # noqa: F401
+            st.success("Installed 'scikit-learn'.")
+            return True
+        except Exception as e:
+            st.error(f"Failed to install 'scikit-learn': {e}")
+            st.info("Try running: pip install scikit-learn joblib threadpoolctl")
+            return False
+
+
 def _import_sklearn():
-    """Lazy-import sklearn components to avoid crashing the app at startup.
-    Returns a dict of required constructors. Raises ImportError with Streamlit hint if missing.
-    """
+    """Lazy-import sklearn components; auto-install if missing."""
     try:
         from sklearn.compose import ColumnTransformer
         from sklearn.calibration import CalibratedClassifierCV
@@ -40,21 +59,30 @@ def _import_sklearn():
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import MaxAbsScaler
         from sklearn.svm import LinearSVC
-        return {
-            'ColumnTransformer': ColumnTransformer,
-            'CalibratedClassifierCV': CalibratedClassifierCV,
-            'TfidfVectorizer': TfidfVectorizer,
-            'SimpleImputer': SimpleImputer,
-            'cross_val_score': cross_val_score,
-            'StratifiedKFold': StratifiedKFold,
-            'Pipeline': Pipeline,
-            'MaxAbsScaler': MaxAbsScaler,
-            'LinearSVC': LinearSVC,
-        }
-    except Exception as e:
-        st.error("scikit-learn is not installed in this Python environment.")
-        st.info("Install dependencies: pip install -r requirements.txt")
-        raise
+    except Exception:
+        if not _ensure_sklearn():
+            raise
+        # retry after install
+        from sklearn.compose import ColumnTransformer
+        from sklearn.calibration import CalibratedClassifierCV
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.impute import SimpleImputer
+        from sklearn.model_selection import cross_val_score, StratifiedKFold
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import MaxAbsScaler
+        from sklearn.svm import LinearSVC
+
+    return {
+        'ColumnTransformer': ColumnTransformer,
+        'CalibratedClassifierCV': CalibratedClassifierCV,
+        'TfidfVectorizer': TfidfVectorizer,
+        'SimpleImputer': SimpleImputer,
+        'cross_val_score': cross_val_score,
+        'StratifiedKFold': StratifiedKFold,
+        'Pipeline': Pipeline,
+        'MaxAbsScaler': MaxAbsScaler,
+        'LinearSVC': LinearSVC,
+    }
 
 
 def _ensure_openpyxl():
