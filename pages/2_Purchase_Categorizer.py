@@ -176,7 +176,11 @@ def build_pipeline(random_state: int = 42, C: float = 1.0) -> Pipeline:
         sparse_threshold=0.3,
     )
     base_clf = LinearSVC(C=C, class_weight="balanced", random_state=random_state)
-    clf = CalibratedClassifierCV(base_estimator=base_clf, method="sigmoid", cv=5)
+    # sklearn>=1.7 uses 'estimator'; older versions used 'base_estimator'
+    try:
+        clf = CalibratedClassifierCV(estimator=base_clf, method="sigmoid", cv=5)
+    except TypeError:
+        clf = CalibratedClassifierCV(base_estimator=base_clf, method="sigmoid", cv=5)
     pipe = Pipeline(steps=[("features", feats), ("clf", clf)])
     return pipe
 
