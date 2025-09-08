@@ -225,7 +225,12 @@ def main():
             st.stop()
 
         try:
-            predict_df = pd.read_excel(predict_file, sheet_name=(sheet_predict or None))
+            sheet_arg = sheet_predict.strip() if isinstance(sheet_predict, str) and sheet_predict.strip() else 0
+            predict_df = pd.read_excel(predict_file, sheet_name=sheet_arg)
+            if isinstance(predict_df, dict):
+                # If multiple sheets returned, pick the first
+                first_key = next(iter(predict_df))
+                predict_df = predict_df[first_key]
         except Exception as e:
             st.error(f"Failed to read dataset B: {e}")
             st.stop()
@@ -253,7 +258,11 @@ def main():
                 st.error("Please upload dataset A (Excel) to train a model, or supply an existing model.")
                 st.stop()
             try:
-                train_df = pd.read_excel(train_file, sheet_name=(sheet_train or None))
+                sheet_arg_tr = sheet_train.strip() if isinstance(sheet_train, str) and sheet_train.strip() else 0
+                train_df = pd.read_excel(train_file, sheet_name=sheet_arg_tr)
+                if isinstance(train_df, dict):
+                    first_key_tr = next(iter(train_df))
+                    train_df = train_df[first_key_tr]
             except Exception as e:
                 st.error(f"Failed to read dataset A: {e}")
                 st.stop()
