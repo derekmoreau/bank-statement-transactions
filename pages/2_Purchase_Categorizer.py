@@ -20,21 +20,41 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.compose import ColumnTransformer
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.impute import SimpleImputer
-from sklearn.model_selection import cross_val_score, StratifiedKFold
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import MaxAbsScaler
-from sklearn.svm import LinearSVC
-
 try:
     import joblib  # noqa: F401
 except Exception:
     joblib = None  # type: ignore
 import pickle
+
+
+def _import_sklearn():
+    """Lazy-import sklearn components to avoid crashing the app at startup.
+    Returns a dict of required constructors. Raises ImportError with Streamlit hint if missing.
+    """
+    try:
+        from sklearn.compose import ColumnTransformer
+        from sklearn.calibration import CalibratedClassifierCV
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.impute import SimpleImputer
+        from sklearn.model_selection import cross_val_score, StratifiedKFold
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import MaxAbsScaler
+        from sklearn.svm import LinearSVC
+        return {
+            'ColumnTransformer': ColumnTransformer,
+            'CalibratedClassifierCV': CalibratedClassifierCV,
+            'TfidfVectorizer': TfidfVectorizer,
+            'SimpleImputer': SimpleImputer,
+            'cross_val_score': cross_val_score,
+            'StratifiedKFold': StratifiedKFold,
+            'Pipeline': Pipeline,
+            'MaxAbsScaler': MaxAbsScaler,
+            'LinearSVC': LinearSVC,
+        }
+    except Exception as e:
+        st.error("scikit-learn is not installed in this Python environment.")
+        st.info("Install dependencies: pip install -r requirements.txt")
+        raise
 
 
 EXPECTED_CATEGORIES = [
@@ -128,7 +148,16 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_pipeline(random_state: int = 42, C: float = 1.0) -> Pipeline:
+def build_pipeline(random_state: int = 42, C: float = 1.0):
+    sk = _import_sklearn()
+    TfidfVectorizer = sk['TfidfVectorizer']
+    ColumnTransformer = sk['ColumnTransformer']
+    Pipeline = sk['Pipeline']
+    MaxAbsScaler = sk['MaxAbsScaler']
+    SimpleImputer = sk['SimpleImputer']
+    CalibratedClassifierCV = sk['CalibratedClassifierCV']
+    LinearSVC = sk['LinearSVC']
+
     char_vec = TfidfVectorizer(
         analyzer="char_wb",
         ngram_range=(3, 5),
@@ -286,6 +315,9 @@ def main():
             model = build_pipeline(random_state=int(random_state), C=float(C))
 
             if cv_folds and cv_folds > 1:
+                sk = _import_sklearn()
+                StratifiedKFold = sk['StratifiedKFold']
+                cross_val_score = sk['cross_val_score']
                 skf = StratifiedKFold(n_splits=int(cv_folds), shuffle=True, random_state=int(random_state))
                 try:
                     scores = cross_val_score(
