@@ -57,6 +57,29 @@ def _import_sklearn():
         raise
 
 
+def _ensure_openpyxl():
+    """Ensure openpyxl is importable; if not, attempt to install it into the
+    current interpreter and import again. Shows Streamlit messages accordingly.
+    """
+    try:
+        import openpyxl  # noqa: F401
+        return True
+    except Exception:
+        st.warning("Installing 'openpyxl' to enable reading Excel files…")
+        try:
+            import subprocess
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--upgrade", "openpyxl"])  # noqa: S603,S607
+            import importlib
+            importlib.invalidate_caches()
+            import openpyxl  # noqa: F401
+            st.success("Installed 'openpyxl'.")
+            return True
+        except Exception as e:
+            st.error(f"Failed to install 'openpyxl': {e}")
+            st.info("Try running: pip install openpyxl")
+            return False
+
+
 EXPECTED_CATEGORIES = [
     "Transfer",
     "Restaurants & Bars",
@@ -257,9 +280,12 @@ def main():
             st.error("Please upload dataset B (Excel).")
             st.stop()
 
+        # Ensure Excel engine is available
+        if not _ensure_openpyxl():
+            st.stop()
         try:
             sheet_arg = sheet_predict.strip() if isinstance(sheet_predict, str) and sheet_predict.strip() else 0
-            predict_df = pd.read_excel(predict_file, sheet_name=sheet_arg)
+            predict_df = pd.read_excel(predict_file, sheet_name=sheet_arg, engine="openpyxl")
             if isinstance(predict_df, dict):
                 # If multiple sheets returned, pick the first
                 first_key = next(iter(predict_df))
@@ -290,9 +316,12 @@ def main():
             if train_file is None:
                 st.error("Please upload dataset A (Excel) to train a model, or supply an existing model.")
                 st.stop()
+            # Ensure Excel engine is available
+            if not _ensure_openpyxl():
+                st.stop()
             try:
                 sheet_arg_tr = sheet_train.strip() if isinstance(sheet_train, str) and sheet_train.strip() else 0
-                train_df = pd.read_excel(train_file, sheet_name=sheet_arg_tr)
+                train_df = pd.read_excel(train_file, sheet_name=sheet_arg_tr, engine="openpyxl")
                 if isinstance(train_df, dict):
                     first_key_tr = next(iter(train_df))
                     train_df = train_df[first_key_tr]
