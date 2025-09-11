@@ -5,9 +5,9 @@ Parse Canadian bank statement PDFs and export clean CSVs via a simple web UI, de
 ## Highlights
 
 - **Web UI (Streamlit)**: Upload multiple PDFs, see parsed tables, validate totals, download combined CSV
-- **RBC Chequing (layout + chars)**: Accurate table reconstruction, multi-line descriptions, date carry-forward
+- **RBC Chequing (v3 char-based)**: Exact description reconstruction from chars, robust header detection, multi-line stitching, date carry-forward
 - **RBC Savings (layout + bands)**: Numeric bands from header midpoints; chequing-style description assembly
-- **RBC Mastercard (chars + spillover)**: Handles description spillover; posting date extraction
+- **RBC Mastercard (word-based + stitching)**: Left-column, word-based multi-line description stitching; trailing amount/header cleanup; posting date extraction; right-column summary parsing
 - **Scotiabank (balance-delta)**: Signs computed solely from balance deltas; improved description extraction
 - **OCR fallback**: When the text layer is broken (e.g., collapsed spacing), selectively OCR pages
 - Interfaces: Web (Streamlit), Desktop GUI (tkinter), Command Line
@@ -86,19 +86,20 @@ python bank_statement_transaction_exporter.py statement.pdf --debug
 
 ## Parsers & Validation
 
-- **RBC Chequing**
-  - Character-aware description assembly (from per-line chars), strict column ranges
-  - Date carry-forward when the date cell is blank
-  - Validates deposits/withdrawals totals (from statement summary)
+- **RBC Chequing (v3)**
+  - Char-based header detection (Date, Description, Withdrawals, Deposits, Balance)
+  - Line grouping from per-char y-centers with gap-aware text reconstruction
+  - Multi-line description stitching with exact spacing; date carry-forward
+  - Validates deposits/withdrawals totals with closing balance cross-check
 
 - **RBC Savings**
   - Numeric column bands derived from header midpoints prevent bleed between columns
   - Chequing-style description assembly
 
 - **RBC Mastercard**
-  - Two-date lines (transaction/posting); posting date used in CSV
-  - Description = spillover after dates + middle slice; robust to wrapping
-  - Validates against “Calculating Your Balance” totals
+  - Two-date lines on left (transaction/posting); posting date used in CSV
+  - Word-based description stitching across continuation lines; strips trailing amounts and stray headers
+  - Right-panel summary parsing of Purchases & debits, Cash advances, Interest, Fees, Payments & credits
 
 - **Scotiabank**
   - Balance-delta method for sign (no keyword heuristics)
