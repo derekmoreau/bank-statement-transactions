@@ -301,6 +301,14 @@ def detect_statement_type(first_page_text: str):
         if mc_cues:
             return 'RBC_MC'
         return 'RBC_CHEQUING'
+    # Scotiabank Visa (credit card) must be detected before generic Scotia chequing
+    if ('scotiabank' in t) and (
+        ('visa' in t) or
+        ('transactions since your last statement' in t) or
+        ('amount($)' in t) or
+        ('ref.#' in t) or ('ref.' in t) or ('details' in t) or ('détails' in t)
+    ):
+        return 'SCOTIA_VISA'
     if 'scotiabank' in t or 'preferred package' in t:
         return 'SCOTIA_CHEQUING'
     if ('bmo' in t) or ('statement period' in t and 'total interest charges' in t):
@@ -783,6 +791,40 @@ def parse_any_statement_from_text(first_page_text: str, full_text: str, data_byt
                 df = parse_scotia_chequing_from_text(full_text, start_dt, end_dt)
         else:
             df = parse_scotia_chequing_from_text(full_text, start_dt, end_dt)
+    elif stype == 'SCOTIA_VISA':
+        df = pd.DataFrame()
+        if data_bytes is not None:
+            try:
+                # Prefer layout-aware Scotia Visa extractor
+                end_year = end_dt.year if end_dt else None
+                end_month = end_dt.month if end_dt else None
+                tx = extract_scotia_visa_transactions_from_bytes(data_bytes, end_year, end_month, source_name or "")
+                # Convert to UI schema: Date (posting), Description, Amount
+                if not tx.empty:
+                    def _fmt_date(d: str) -> str:
+                        if re.match(r"^\d{4}-\d{2}-\d{2}$", d or ""):
+                            return f"{d[8:10]}/{d[5:7]}/{d[:4]}"
+                        return d
+                    df = pd.DataFrame({
+                        'Date': [ _fmt_date(s) for s in tx['posting_date'].tolist() ],
+                        'Description': tx['description'].tolist(),
+                        'Amount': tx['amount'].astype(float).tolist(),
+                    })
+            except Exception:
+                df = pd.DataFrame()
+        # Summary for validation (only if we can compute both sides)
+        if data_bytes is not None:
+            try:
+                s = parse_scotia_visa_summary_from_bytes(data_bytes)
+                if (s.get('payments_credits') is not None) and (s.get('purchases_charges') is not None) and (s.get('interest') is not None):
+                    summary = {
+                        'pos_label': 'Purchases + interest',
+                        'pos_value': float(s['purchases_charges']) + float(s['interest']),
+                        'neg_label': 'Payments & credits',
+                        'neg_value': -abs(float(s['payments_credits'])),
+                    }
+            except Exception:
+                pass
     else:
         # Try all if we couldn't detect type
         for fn in (parse_bmo_from_text, parse_rbc_mc_from_text, parse_rbc_chequing_from_text, parse_scotia_chequing_from_text):
@@ -794,6 +836,251 @@ def parse_any_statement_from_text(first_page_text: str, full_text: str, data_byt
         return pd.DataFrame(), summary
     df._summary = summary
     return df, summary
+
+# =========================
+# Scotiabank Visa (layout-aware, left-column with date pairs)
+# =========================
+
+_SCOTIA_VISA_MONTHS = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,"Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
+_SCOTIA_VISA_MONTHS_SET = set([m.upper() for m in _SCOTIA_VISA_MONTHS.keys()])
+_SCOTIA_VISA_AMT_TOKEN = re.compile(r"^-?\$?\d{1,3}(?:,\d{3})*\.\d{2}-?$")
+
+def _scotia_visa_parse_closing_from_pdf_text(text: str):
+    m = re.search(r"Statement date\s+([A-Za-z]{3,9})\s+(\d{1,2}),\s*(\d{4})", text or "", flags=re.I)
+    if m:
+        mon_name, day, year = m.groups()
+        mon3 = mon_name[:3].title()
+        return int(year), _SCOTIA_VISA_MONTHS.get(mon3, 12), int(day)
+    return None
+
+def _scotia_visa_to_iso_from_mon_day(mon_str: str, day_str: str, closing_year: int, closing_month: int) -> str:
+    mon = _SCOTIA_VISA_MONTHS.get((mon_str or '')[:3].title())
+    year = closing_year if mon and mon <= closing_month else (closing_year - 1 if mon else closing_year)
+    return f"{year:04d}-{mon:02d}-{int(day_str):02d}" if mon else f"{day_str} {mon_str}"
+
+def _scotia_visa_group_lines(words, y_tol=0.9):
+    lines=[]; cur=[]; cur_y=None
+    for w in sorted(words, key=lambda w:(round(float(w.get("top",0.0)),2), float(w.get("x0",0.0)))):
+        y=round(float(w.get("top",0.0)),2)
+        if cur_y is None or abs(y-cur_y)<=y_tol:
+            cur.append(w); cur_y=y if cur_y is None else (cur_y+y)/2.0
+        else:
+            lines.append(cur); cur=[w]; cur_y=y
+    if cur: lines.append(cur)
+    return lines
+
+def _scotia_visa_find_vertical_cut(page):
+    words = page.extract_words(x_tolerance=1.6, y_tolerance=1.6, keep_blank_chars=False, use_text_flow=True) or []
+    x_positions = [float(w.get("x0",0.0)) for w in words if "statement" in str(w.get("text","")) .lower() and "period" in str(w.get("text","")) .lower()]
+    if x_positions:
+        return max(0.0, min(x_positions) - 8.0)
+    return float(page.width) * 0.75
+
+_SCOTIA_VISA_TITLE_PAT = re.compile(r"TRANSACTIONS\s+SINCE\s+YOUR\s+LAST\s+STATEMENT", re.I)
+_SCOTIA_VISA_BOTTOM_PATS = [re.compile(p, re.I) for p in [
+    r"INTEREST\s+CHARGES", r"ACCOUNT\s+SUMMARY", r"SUMMARY\s+OF\s+ACCOUNT", r"NEW\s+BALANCE"
+]]
+
+def _scotia_visa_find_transactions_bounds(page):
+    x_cut = _scotia_visa_find_vertical_cut(page)
+    words = page.extract_words(x_tolerance=1.6, y_tolerance=1.6, keep_blank_chars=False, use_text_flow=True) or []
+    y_top = None
+    for w in words:
+        if _SCOTIA_VISA_TITLE_PAT.search(str(w.get("text",""))):
+            y_top = float(w.get("top", 0.0)); break
+    if y_top is None:
+        heads = [w for w in words if (str(w.get("text","")) .strip().upper() in {"REF.#","REF.","REF","DETAILS","DÉTAILS","AMOUNT($)","AMOUNT","MONTANT"})]
+        if heads:
+            y_top = min(float(w.get("top",0.0)) for w in heads) - 6.0
+    if y_top is None:
+        return None
+    y_bottom = float(page.height)
+    for w in words:
+        for pat in _SCOTIA_VISA_BOTTOM_PATS:
+            if pat.search(str(w.get("text",""))) and float(w.get("top",0.0)) > y_top + 20.0:
+                y_bottom = min(y_bottom, float(w.get("top",0.0)) - 4.0)
+                break
+    return (0.0, y_top + 16.0, x_cut, y_bottom)
+
+def _scotia_visa_find_headers_in_crop(crop_page):
+    words = crop_page.extract_words(x_tolerance=1.5, y_tolerance=1.4, keep_blank_chars=False, use_text_flow=True) or []
+    details_x = None; amount_x = None
+    for w in words:
+        up = str(w.get("text","")) .strip().upper()
+        if up in {"DETAILS","DÉTAILS"}: details_x = float(w.get("x0",0.0))
+        if up in {"AMOUNT","MONTANT"}:  amount_x  = float(w.get("x0",0.0))
+    if details_x is None: details_x = float(crop_page.width) * 0.33
+    if amount_x is None or amount_x <= details_x+30.0: amount_x = float(crop_page.width) * 0.78
+    details_x = max(0.0, details_x - 4.0)
+    return details_x, amount_x
+
+def _scotia_visa_detect_datepair_tokens(tokens):
+    i=0; found=[]
+    while i < len(tokens)-1 and len(found) < 2:
+        up = str(tokens[i]).upper()
+        if up[:3] in _SCOTIA_VISA_MONTHS_SET and re.fullmatch(r"\d{1,2}", str(tokens[i+1])):
+            found.append((tokens[i], tokens[i+1])); i += 2
+        else:
+            i += 1
+    if len(found) == 2:
+        (m1,d1),(m2,d2) = found[0], found[1]
+        return m1, d1, m2, d2
+    return None
+
+def _scotia_visa_consume_left_desc_tokens(left_tokens, remove_leading_ref=True):
+    toks = list(left_tokens)
+    if remove_leading_ref:
+        while toks and re.fullmatch(r"[A-Za-z]*\d+[A-Za-z]*", str(toks[0])):
+            toks.pop(0)
+    i = 0; consumed_dates = 0
+    while i < len(toks) and consumed_dates < 2:
+        up = str(toks[i]).upper()
+        if up[:3] in _SCOTIA_VISA_MONTHS_SET and i+1 < len(toks) and re.fullmatch(r"\d{1,2}", str(toks[i+1])):
+            toks.pop(i); toks.pop(i); consumed_dates += 1
+        else:
+            i += 1
+    return " ".join(str(t) for t in toks).strip()
+
+def _scotia_visa_desc_from_line_with_rules(line, details_x, amount_x):
+    toks_sorted = sorted([w for w in line if float(w.get("x0",0.0)) >= details_x], key=lambda w: float(w.get("x0",0.0)))
+    clean = []
+    for w in toks_sorted:
+        t = str(w.get("text",""))
+        if _SCOTIA_VISA_AMT_TOKEN.match(t.replace(",","")) or float(w.get("x0",0.0)) >= amount_x:
+            break
+        up = t.upper()
+        if up in {"MONEYBACKTM","REWARD"}:
+            continue
+        clean.append(t)
+    return " ".join(clean).strip()
+
+def _scotia_visa_desc_from_line_combined(L, details_x, amount_x):
+    left_tokens_only = [str(w.get("text","")) for w in sorted(L, key=lambda ww: float(ww.get("x0",0.0))) if float(w.get("x0",0.0)) < details_x]
+    left_desc = _scotia_visa_consume_left_desc_tokens(left_tokens_only)
+    right_desc = _scotia_visa_desc_from_line_with_rules(L, details_x, amount_x)
+    return " ".join([s for s in [left_desc, right_desc] if s]).strip()
+
+def extract_scotia_visa_transactions_from_bytes(data_bytes: bytes, fallback_closing_year: Optional[int], fallback_closing_month: Optional[int], source_name: str = "") -> pd.DataFrame:
+    rows = []
+    with pdfplumber.open(io.BytesIO(data_bytes)) as pdf:
+        first_text = (pdf.pages[0].extract_text() or "") if pdf.pages else ""
+        ymd = _scotia_visa_parse_closing_from_pdf_text(first_text)
+        if not ymd and source_name:
+            m = re.search(r"(20\d{2})-(\d{2})-(\d{2})", source_name)
+            if m:
+                ymd = tuple(map(int, m.groups()))
+        if not ymd and (fallback_closing_year is not None and fallback_closing_month is not None):
+            ymd = (int(fallback_closing_year), int(fallback_closing_month), 1)
+        if not ymd:
+            now = datetime.now(); ymd = (now.year, now.month, now.day)
+        closing_year, closing_month = int(ymd[0]), int(ymd[1])
+
+        for page in pdf.pages:
+            bounds = _scotia_visa_find_transactions_bounds(page)
+            if not bounds:
+                continue
+            crop = page.crop(bounds)
+            details_x, amount_x = _scotia_visa_find_headers_in_crop(crop)
+            words = crop.extract_words(x_tolerance=1.3, y_tolerance=1.1, keep_blank_chars=False, use_text_flow=True) or []
+            lines = _scotia_visa_group_lines(words, y_tol=0.9)
+
+            i=0
+            while i < len(lines):
+                L = lines[i]
+                left_tokens_only = [str(w.get("text","")) for w in sorted(L, key=lambda ww: float(ww.get("x0",0.0))) if float(w.get("x0",0.0)) < details_x]
+                dp = _scotia_visa_detect_datepair_tokens(left_tokens_only)
+                if not dp:
+                    i += 1; continue
+                mon1,d1,mon2,d2 = dp
+
+                desc = _scotia_visa_desc_from_line_combined(L, details_x, amount_x)
+
+                # continuation check
+                if i+1 < len(lines):
+                    L2 = lines[i+1]
+                    left2 = [str(w.get("text","")) for w in sorted(L2, key=lambda ww: float(ww.get("x0",0.0))) if float(w.get("x0",0.0)) < details_x]
+                    if not _scotia_visa_detect_datepair_tokens(left2):
+                        line2_text = " ".join(str(w.get("text","")) for w in L2)
+                        forbidden = re.search(r"(SUB[-\s]?TOTAL|NEW\s+BALANCE|INTEREST|PAYMENTS/\s*credits|PURCHASES/\s*charges)", line2_text, flags=re.I)
+                        if not forbidden:
+                            cont_left_desc = _scotia_visa_consume_left_desc_tokens(left2, remove_leading_ref=False)
+                            if cont_left_desc:
+                                desc = f"{desc} {cont_left_desc}".strip()
+                            i += 1
+
+                # gather currency candidates across lines (prefer amount column)
+                cands = []
+                def collect(line):
+                    for w in line:
+                        t = str(w.get("text","")) .replace(",","").replace("$","").strip()
+                        if re.fullmatch(r"\-?\d+\.\d{2}\-?", t):
+                            sign = -1 if (t.startswith('-') or t.endswith('-')) else 1
+                            try:
+                                val = sign * float(t.replace('-', ''))
+                            except Exception:
+                                continue
+                            in_amount_col = (float(w.get("x0",0.0)) >= amount_x - 2.0)
+                            cands.append((in_amount_col, abs(val), val))
+                collect(L)
+                if (i < len(lines)):
+                    # also try the next line if we consumed continuation above
+                    if i+1 < len(lines):
+                        collect(lines[i])  # already collected
+                        collect(lines[i+1])
+
+                if not cands:
+                    i += 1; continue
+                negs = [v for col,absv,v in cands if v < 0]
+                if negs:
+                    amt = round(sorted(negs, key=lambda x: -abs(x))[0], 2)
+                else:
+                    amt_col = [v for col,absv,v in cands if col]
+                    if amt_col:
+                        amt = round(sorted(amt_col, key=lambda x: -abs(x))[0], 2)
+                    else:
+                        amt = round(sorted([v for _,_,v in cands], key=lambda x: -abs(x))[0], 2)
+
+                rows.append({
+                    'transaction_date': _scotia_visa_to_iso_from_mon_day(str(mon1), str(d1), closing_year, closing_month),
+                    'posting_date':     _scotia_visa_to_iso_from_mon_day(str(mon2), str(d2), closing_year, closing_month),
+                    'description': " ".join(str(desc).split()),
+                    'amount': float(amt),
+                })
+                i += 1
+
+    df = pd.DataFrame(rows, columns=["transaction_date","posting_date","description","amount"]) if rows else pd.DataFrame(columns=["transaction_date","posting_date","description","amount"])
+    if not df.empty:
+        df["type"] = df["amount"].apply(lambda x: "payment_or_credit" if float(x) < 0 else "purchase_or_debit")
+    return df
+
+_SCOTIA_VISA_SUMMARY_PATS = {
+    "interest":           [r"\binterest\b", r"\bint(é|e)r(ê|e)t(s)?\b"],
+    "payments_credits":   [r"\bpayments\s*/?\s*&?\s*credits\b", r"\bpaiements\s*/?\s*&?\s*cr(é|e)dit(s)?\b"],
+    "purchases_charges":  [r"\bpurchases\s*/?\s*&?\s*charges\b", r"\bachats\s*/?\s*&?\s*frais\b"],
+}
+
+def parse_scotia_visa_summary_from_bytes(data_bytes: bytes) -> dict:
+    vals = {"interest": None, "payments_credits": None, "purchases_charges": None}
+    with pdfplumber.open(io.BytesIO(data_bytes)) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=1.8, y_tolerance=1.8, keep_blank_chars=False, use_text_flow=True) or []
+            lines = _scotia_visa_group_lines(words, y_tol=1.0)
+            for L in lines:
+                line_text = " ".join(str(w.get('text','')) for w in L)
+                m_all = list(re.finditer(r"-?\$?\s*\d{1,3}(?:,\d{3})*\.\d{2}-?", line_text.replace(",", "")))
+                m_amt = m_all[-1].group(0) if m_all else None
+                for key, pats in _SCOTIA_VISA_SUMMARY_PATS.items():
+                    if vals[key] is None and any(re.search(p, line_text, flags=re.I) for p in pats):
+                        if m_amt:
+                            raw = m_amt.replace("$", "").replace(" ", "").replace(",", "")
+                            raw = raw.replace("-", "")
+                            try:
+                                vals[key] = float(raw)
+                            except Exception:
+                                pass
+            if all(vals[k] is not None for k in vals):
+                break
+    return vals
 
 def _group_words_by_lines(words, y_tol=3.0):
     """Group pdfplumber words into line buckets by their y (top) coordinate."""

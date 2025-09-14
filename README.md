@@ -12,7 +12,7 @@ Parse Canadian bank statement PDFs and export clean CSVs via a simple web UI, de
 - **OCR fallback**: When the text layer is broken (e.g., collapsed spacing), selectively OCR pages
 - Interfaces: Web (Streamlit), Desktop GUI (tkinter), Command Line
 
-Supported banks today: RBC (Chequing, Savings, Mastercard), Scotiabank (chequing/savings e-statements), BMO
+Supported banks today: RBC (Chequing, Savings, Mastercard), Scotiabank (chequing/savings e-statements, Visa credit card), BMO
 
 ## Quick Start
 
@@ -101,10 +101,16 @@ python bank_statement_transaction_exporter.py statement.pdf --debug
   - Word-based description stitching across continuation lines; strips trailing amounts and stray headers
   - Right-panel summary parsing of Purchases & debits, Cash advances, Interest, Fees, Payments & credits
 
-- **Scotiabank**
+- **Scotiabank (Chequing/Savings)**
   - Balance-delta method for sign (no keyword heuristics)
   - Improved description extraction across the full row span
   - Validates deposits/withdrawals totals and closing balance
+
+- **Scotiabank Visa (credit card)**
+  - Layout-aware parser using page words with left-column date pairs (Transaction/Posting)
+  - Robust description assembly with continuation-line stitching; ignores summary headers
+  - Amount pick prioritizes the Amount column; correct sign handling for credits
+  - Validation support against the summary panel (Payments & credits, Purchases & charges, Interest)
 
 ## File Structure
 - `bank_statement_transaction_exporter.py` — Main parser (Streamlit + CLI) and all bank parsers
